@@ -1,0 +1,3 @@
+0x4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358
+https://harlequin-faithful-eel-705.mypinata.cloud/ipfs/QmSv7s2qVb5odW2UBJ4QUk2XsW21w2YcyrWLW6B5TE6Xd7/1.json
+500000000000000000
