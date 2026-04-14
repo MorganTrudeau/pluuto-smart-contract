@@ -1,8 +1,21 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
 
-const { PRIVATE_KEY, SEPOLIA_RPC_URL, BASE_RPC_URL, ETHERSCAN_API_KEY } = process.env;
+// Load environment-specific .env file based on --network flag
+const network = process.argv.includes("--network")
+  ? process.argv[process.argv.indexOf("--network") + 1]
+  : undefined;
+
+if (network === "base") {
+  dotenv.config({ path: ".env.base" });
+} else if (network === "sepolia") {
+  dotenv.config({ path: ".env.sepolia" });
+} else {
+  dotenv.config(); // fallback to .env for local/hardhat
+}
+
+const { PRIVATE_KEY, RPC_URL, ETHERSCAN_API_KEY } = process.env;
 
 // Validate private key format (must be 64 hex chars, optionally prefixed with 0x)
 const isValidPrivateKey = (key: string | undefined): boolean => {
@@ -24,16 +37,28 @@ const config: HardhatUserConfig = {
   networks: {
     hardhat: {},
     sepolia: {
-      url: SEPOLIA_RPC_URL || "https://sepolia.infura.io/v3/YOUR_KEY",
+      url: RPC_URL || "https://sepolia.infura.io/v3/YOUR_KEY",
       accounts: isValidPrivateKey(PRIVATE_KEY) ? [PRIVATE_KEY!] : []
     },
     base: {
-      url: BASE_RPC_URL || "https://mainnet.base.org",
+      url: RPC_URL || "https://mainnet.base.org",
       accounts: isValidPrivateKey(PRIVATE_KEY) ? [PRIVATE_KEY!] : []
     }
   },
   etherscan: {
-    apiKey: ETHERSCAN_API_KEY || "",
+    apiKey: {
+      base: ETHERSCAN_API_KEY || "",
+    },
+    customChains: [
+      {
+        network: "base",
+        chainId: 8453,
+        urls: {
+          apiURL: "https://api.basescan.org/api",
+          browserURL: "https://basescan.org",
+        },
+      },
+    ],
   },
   sourcify: {
     enabled: false

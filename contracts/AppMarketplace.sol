@@ -7,8 +7,9 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
-contract AppMarketplace is EIP712, Ownable, ReentrancyGuard, Pausable {
+contract AppMarketplace is EIP712, Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
     uint256 public constant MAX_FEE_BPS = 2000;
 
     bytes32 public constant ORDER_TYPEHASH = keccak256(
@@ -116,6 +117,7 @@ contract AppMarketplace is EIP712, Ownable, ReentrancyGuard, Pausable {
         require(!filled[orderHash], "Order already filled");
         require(order.expiry == 0 || block.timestamp <= order.expiry, "Order expired");
         require(order.nonce >= minNonce[order.seller], "Nonce too low");
+        require(order.price > 0, "Price must be > 0");
         require(msg.value == order.price, "Incorrect payment");
         require(msg.sender != order.seller, "Cannot buy own order");
 
@@ -295,5 +297,9 @@ contract AppMarketplace is EIP712, Ownable, ReentrancyGuard, Pausable {
 
     function getDomainSeparator() external view returns (bytes32) {
         return _domainSeparatorV4();
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
     }
 }
