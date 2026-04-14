@@ -15,9 +15,10 @@ contract AppMarketplaceToken is
     uint256 public constant MAX_FEE_BPS = 2000;
     uint256 public constant ESCROW_TIMEOUT = 7 days;
 
-    uint256 private _nextTokenId;
-    uint256 private _nextAppId;
+    // appId == tokenId — single incrementing counter
+    uint256 private _nextId;
     uint256 public marketplaceFeeBps;
+    uint256 public mintFee;
     address public feeRecipient;
     address public platformAddress;
 
@@ -31,10 +32,8 @@ contract AppMarketplaceToken is
 
     struct App {
         uint256 appId;
-        uint256 tokenId;
         address developer;
         bytes32 repoFingerprint;
-        string metadataURI;
     }
 
     struct Listing {
@@ -51,46 +50,35 @@ contract AppMarketplaceToken is
     }
 
     mapping(uint256 => App) public apps;
-    mapping(uint256 => uint256) public tokenIdToAppId;
     mapping(uint256 => Listing) public listings;
-    mapping(uint256 => bool) public appIdExists;
-    mapping(bytes32 => bool) public repoFingerprintUsed;
+    mapping(bytes32 => uint256) public repoFingerprintToAppId;
     mapping(uint256 => Escrow) public escrows;
 
     event AppCreated(
         uint256 indexed appId,
-        uint256 indexed tokenId,
         address indexed developer,
         bytes32 repoFingerprint
     );
 
-    event AppMinted(
-        uint256 indexed appId,
-        uint256 indexed tokenId,
-        address indexed developer
-    );
-
     event AppListed(
         uint256 indexed appId,
-        uint256 indexed tokenId,
         address indexed seller,
         uint256 price
     );
 
     event AppUnlisted(
         uint256 indexed appId,
-        uint256 indexed tokenId,
         address indexed seller
     );
 
     event OwnershipChanged(
         uint256 indexed appId,
-        uint256 indexed tokenId,
         address indexed from,
         address to
     );
 
     event MarketplaceFeeUpdated(uint256 newFeeBps);
+    event MintFeeUpdated(uint256 newMintFee);
     event FeeRecipientUpdated(address newRecipient);
     event MetadataURIUpdated(uint256 indexed appId, string newURI);
 
@@ -122,11 +110,13 @@ contract AppMarketplaceToken is
     );
 
     event PlatformAddressUpdated(address newPlatformAddress);
+    event EmergencyWithdrawal(address indexed to, uint256 amount);
 
     constructor(
         string memory name_,
         string memory symbol_,
         uint256 initialFeeBps_,
+        uint256 mintFee_,
         address feeRecipient_,
         address platformAddress_
     ) ERC721(name_, symbol_) Ownable(msg.sender) {
@@ -134,82 +124,97 @@ contract AppMarketplaceToken is
         require(feeRecipient_ != address(0), "Invalid fee recipient");
         require(platformAddress_ != address(0), "Invalid platform address");
 
-        _nextTokenId = 1;
-        _nextAppId = 1;
+        _nextId = 1;
         marketplaceFeeBps = initialFeeBps_;
+        mintFee = mintFee_;
         feeRecipient = feeRecipient_;
         platformAddress = platformAddress_;
     }
 
+    function _appExists(uint256 appId) internal view returns (bool) {
+        return apps[appId].developer != address(0);
+    }
+
     function mintAppToken(
         bytes32 repoFingerprint,
-        string memory metadataURI,
-        uint256 listingPrice
-    ) external whenNotPaused returns (uint256 appId, uint256 tokenId) {
+        string memory metadataURI
+    ) public payable whenNotPaused returns (uint256 appId) {
         require(repoFingerprint != bytes32(0), "Invalid fingerprint");
-        require(!repoFingerprintUsed[repoFingerprint], "Fingerprint used");
-        require(listingPrice > 0, "Price must be > 0");
+        require(repoFingerprintToAppId[repoFingerprint] == 0, "Fingerprint used");
+        require(msg.value >= mintFee, "Insufficient mint fee");
 
-        appId = _nextAppId++;
-        tokenId = _nextTokenId++;
+        appId = _nextId++;
 
-        repoFingerprintUsed[repoFingerprint] = true;
-        appIdExists[appId] = true;
+        repoFingerprintToAppId[repoFingerprint] = appId;
 
         apps[appId] = App({
             appId: appId,
-            tokenId: tokenId,
             developer: msg.sender,
-            repoFingerprint: repoFingerprint,
-            metadataURI: metadataURI
+            repoFingerprint: repoFingerprint
         });
 
-        tokenIdToAppId[tokenId] = appId;
+        _safeMint(msg.sender, appId);
+        _setTokenURI(appId, metadataURI);
 
-        _safeMint(msg.sender, tokenId);
-        _setTokenURI(tokenId, metadataURI);
+        if (mintFee > 0) {
+            (bool success, ) = feeRecipient.call{value: mintFee}("");
+            require(success, "Mint fee transfer failed");
+        }
 
-        // Auto-list the app for sale
+        uint256 excess = msg.value - mintFee;
+        if (excess > 0) {
+            (bool refundSuccess, ) = msg.sender.call{value: excess}("");
+            require(refundSuccess, "Refund failed");
+        }
+
+        emit AppCreated(appId, msg.sender, repoFingerprint);
+
+        return appId;
+    }
+
+    function mintAndListAppToken(
+        bytes32 repoFingerprint,
+        string memory metadataURI,
+        uint256 listingPrice
+    ) external payable whenNotPaused returns (uint256 appId) {
+        require(listingPrice > 0, "Price must be > 0");
+
+        appId = mintAppToken(repoFingerprint, metadataURI);
+
         listings[appId] = Listing({isListed: true, price: listingPrice});
 
-        emit AppCreated(appId, tokenId, msg.sender, repoFingerprint);
-        emit AppMinted(appId, tokenId, msg.sender);
-        emit AppListed(appId, tokenId, msg.sender, listingPrice);
+        emit AppListed(appId, msg.sender, listingPrice);
 
-        return (appId, tokenId);
+        return appId;
     }
 
     function listForSale(uint256 appId, uint256 price) external whenNotPaused {
-        require(appIdExists[appId], "App does not exist");
+        require(_appExists(appId), "App does not exist");
         require(price > 0, "Price must be > 0");
-
-        uint256 tokenId = apps[appId].tokenId;
-        require(ownerOf(tokenId) == msg.sender, "Not owner");
+        require(ownerOf(appId) == msg.sender, "Not owner");
         require(!listings[appId].isListed, "Already listed");
         require(escrows[appId].status != EscrowStatus.PENDING, "Pending escrow");
 
         listings[appId] = Listing({isListed: true, price: price});
 
-        emit AppListed(appId, tokenId, msg.sender, price);
+        emit AppListed(appId, msg.sender, price);
     }
 
     function cancelListing(uint256 appId) external {
-        require(appIdExists[appId], "App does not exist");
+        require(_appExists(appId), "App does not exist");
         require(listings[appId].isListed, "Not listed");
-
-        uint256 tokenId = apps[appId].tokenId;
-        require(ownerOf(tokenId) == msg.sender, "Not owner");
+        require(ownerOf(appId) == msg.sender, "Not owner");
 
         listings[appId].isListed = false;
         listings[appId].price = 0;
 
-        emit AppUnlisted(appId, tokenId, msg.sender);
+        emit AppUnlisted(appId, msg.sender);
     }
 
     function purchaseWithEscrow(uint256 appId) external payable nonReentrant whenNotPaused {
-        require(appIdExists[appId], "App does not exist");
+        require(_appExists(appId), "App does not exist");
         require(listings[appId].isListed, "Not listed");
-        
+
         EscrowStatus status = escrows[appId].status;
         require(
             status == EscrowStatus.NONE ||
@@ -222,8 +227,7 @@ contract AppMarketplaceToken is
         uint256 price = listings[appId].price;
         require(msg.value == price, "Incorrect payment");
 
-        uint256 tokenId = apps[appId].tokenId;
-        address seller = ownerOf(tokenId);
+        address seller = ownerOf(appId);
         require(seller != msg.sender, "Cannot buy own app");
 
         listings[appId].isListed = false;
@@ -237,8 +241,7 @@ contract AppMarketplaceToken is
             createdAt: block.timestamp
         });
 
-        // Custody NFT in contract to prevent seller from transferring it away
-        _transfer(seller, address(this), tokenId);
+        _transfer(seller, address(this), appId);
 
         emit EscrowCreated(appId, msg.sender, seller, msg.value);
     }
@@ -251,14 +254,54 @@ contract AppMarketplaceToken is
             "Only platform or buyer"
         );
 
+        _releaseEscrow(appId, escrow);
+    }
+
+    function refundEscrow(uint256 appId) external nonReentrant {
+        Escrow storage escrow = escrows[appId];
+        require(escrow.status == EscrowStatus.PENDING, "Not refundable");
+        require(msg.sender == escrow.buyer, "Only buyer");
+
+        _refundEscrow(appId, escrow);
+    }
+
+    function expireEscrow(uint256 appId) external nonReentrant {
+        Escrow storage escrow = escrows[appId];
+        require(escrow.status == EscrowStatus.PENDING, "Not pending");
+        require(block.timestamp >= escrow.createdAt + ESCROW_TIMEOUT, "Not expired");
+
+        escrow.status = EscrowStatus.EXPIRED;
+
+        _transfer(address(this), escrow.seller, appId);
+
+        listings[appId].isListed = true;
+        listings[appId].price = escrow.amount;
+
+        (bool success, ) = escrow.buyer.call{value: escrow.amount}("");
+        require(success, "Refund failed");
+
+        emit EscrowExpired(appId, escrow.buyer, escrow.amount);
+        emit EscrowRefunded(appId, escrow.buyer, escrow.amount);
+    }
+
+    function resolveEscrowDispute(uint256 appId, bool refundToBuyer) external onlyOwner nonReentrant {
+        Escrow storage escrow = escrows[appId];
+        require(escrow.status == EscrowStatus.PENDING, "Not pending");
+
+        if (refundToBuyer) {
+            _refundEscrow(appId, escrow);
+        } else {
+            _releaseEscrow(appId, escrow);
+        }
+    }
+
+    function _releaseEscrow(uint256 appId, Escrow storage escrow) internal {
         uint256 fee = (escrow.amount * marketplaceFeeBps) / 10_000;
         uint256 sellerAmount = escrow.amount - fee;
 
         escrow.status = EscrowStatus.COMPLETED;
 
-        uint256 tokenId = apps[appId].tokenId;
-        // NFT is held by contract during escrow; release to buyer
-        _transfer(address(this), escrow.buyer, tokenId);
+        _safeTransfer(address(this), escrow.buyer, appId);
 
         if (fee > 0) {
             (bool feeSuccess, ) = feeRecipient.call{value: fee}("");
@@ -271,22 +314,13 @@ contract AppMarketplaceToken is
         emit EscrowReleased(appId, escrow.buyer, escrow.seller, escrow.amount, fee);
     }
 
-    function refundEscrow(uint256 appId) external nonReentrant {
-        Escrow storage escrow = escrows[appId];
-        require(
-            escrow.status == EscrowStatus.PENDING,
-            "Not refundable"
-        );
-        require(msg.sender == escrow.buyer, "Only buyer");
-
+    function _refundEscrow(uint256 appId, Escrow storage escrow) internal {
         uint256 amount = escrow.amount;
         address buyer = escrow.buyer;
 
         escrow.status = EscrowStatus.REFUNDED;
 
-        uint256 tokenId_ = apps[appId].tokenId;
-        // Return NFT from contract custody back to seller
-        _transfer(address(this), escrow.seller, tokenId_);
+        _transfer(address(this), escrow.seller, appId);
 
         listings[appId].isListed = true;
         listings[appId].price = amount;
@@ -295,81 +329,17 @@ contract AppMarketplaceToken is
         require(success, "Refund failed");
 
         emit EscrowRefunded(appId, buyer, amount);
-    }
-
-    function expireEscrow(uint256 appId) external nonReentrant {
-        Escrow storage escrow = escrows[appId];
-        require(escrow.status == EscrowStatus.PENDING, "Not pending");
-        require(block.timestamp >= escrow.createdAt + ESCROW_TIMEOUT, "Not expired");
-
-        uint256 amount = escrow.amount;
-        address buyer = escrow.buyer;
-
-        escrow.status = EscrowStatus.EXPIRED;
-
-        uint256 tokenId_ = apps[appId].tokenId;
-        // Return NFT from contract custody back to seller
-        _transfer(address(this), escrow.seller, tokenId_);
-
-        // Re-list the app at its original price so the seller can sell again
-        listings[appId].isListed = true;
-        listings[appId].price = amount;
-
-        // Auto-refund the buyer immediately
-        (bool success, ) = buyer.call{value: amount}("");
-        require(success, "Refund failed");
-
-        emit EscrowExpired(appId, buyer, amount);
-        emit EscrowRefunded(appId, buyer, amount);
-    }
-
-    function resolveEscrowDispute(uint256 appId, bool refundToBuyer) external onlyOwner nonReentrant {
-        Escrow storage escrow = escrows[appId];
-        require(escrow.status == EscrowStatus.PENDING, "Not pending");
-
-        if (refundToBuyer) {
-            uint256 amount = escrow.amount;
-            address buyer = escrow.buyer;
-
-            escrow.status = EscrowStatus.REFUNDED;
-
-            uint256 tokenId_ = apps[appId].tokenId;
-            // Return NFT from contract custody back to seller
-            _transfer(address(this), escrow.seller, tokenId_);
-
-            listings[appId].isListed = true;
-            listings[appId].price = amount;
-
-            (bool success, ) = buyer.call{value: amount}("");
-            require(success, "Refund failed");
-
-            emit EscrowRefunded(appId, buyer, amount);
-        } else {
-            uint256 fee = (escrow.amount * marketplaceFeeBps) / 10_000;
-            uint256 sellerAmount = escrow.amount - fee;
-
-            escrow.status = EscrowStatus.COMPLETED;
-
-            uint256 tokenId = apps[appId].tokenId;
-            // NFT is held by contract during escrow; release to buyer
-            _transfer(address(this), escrow.buyer, tokenId);
-
-            if (fee > 0) {
-                (bool feeSuccess, ) = feeRecipient.call{value: fee}("");
-                require(feeSuccess, "Fee transfer failed");
-            }
-
-            (bool sellerSuccess, ) = escrow.seller.call{value: sellerAmount}("");
-            require(sellerSuccess, "Payment failed");
-
-            emit EscrowReleased(appId, escrow.buyer, escrow.seller, escrow.amount, fee);
-        }
     }
 
     function setMarketplaceFeeBps(uint256 newFeeBps) external onlyOwner {
         require(newFeeBps <= MAX_FEE_BPS, "Fee exceeds max");
         marketplaceFeeBps = newFeeBps;
         emit MarketplaceFeeUpdated(newFeeBps);
+    }
+
+    function setMintFee(uint256 newMintFee) external onlyOwner {
+        mintFee = newMintFee;
+        emit MintFeeUpdated(newMintFee);
     }
 
     function setFeeRecipient(address newRecipient) external onlyOwner {
@@ -384,16 +354,23 @@ contract AppMarketplaceToken is
         emit PlatformAddressUpdated(newPlatformAddress);
     }
 
+    /// @notice Emergency function to withdraw ETH stuck in the contract due to failed transfers.
+    function emergencyWithdraw(address payable to, uint256 amount) external onlyOwner nonReentrant {
+        require(to != address(0), "Invalid recipient");
+        require(amount > 0, "Amount must be > 0");
+        require(address(this).balance >= amount, "Insufficient balance");
+
+        (bool success, ) = to.call{value: amount}("");
+        require(success, "Withdrawal failed");
+
+        emit EmergencyWithdrawal(to, amount);
+    }
+
     function updateMetadataURI(uint256 appId, string memory newURI) external {
-        require(appIdExists[appId], "App does not exist");
+        require(_appExists(appId), "App does not exist");
+        require(msg.sender == ownerOf(appId) || msg.sender == owner(), "Not authorized");
 
-        uint256 tokenId = apps[appId].tokenId;
-        address tokenOwner = ownerOf(tokenId);
-
-        require(msg.sender == tokenOwner || msg.sender == owner(), "Not authorized");
-
-        apps[appId].metadataURI = newURI;
-        _setTokenURI(tokenId, newURI);
+        _setTokenURI(appId, newURI);
 
         emit MetadataURIUpdated(appId, newURI);
     }
@@ -407,26 +384,24 @@ contract AppMarketplaceToken is
     }
 
     function getApp(uint256 appId) external view returns (App memory) {
-        require(appIdExists[appId], "App does not exist");
+        require(_appExists(appId), "App does not exist");
         return apps[appId];
     }
 
-    function getAppIdFromTokenId(uint256 tokenId) external view returns (uint256) {
-        require(tokenIdToAppId[tokenId] != 0, "No associated app");
-        return tokenIdToAppId[tokenId];
-    }
-
     function getListing(uint256 appId) external view returns (bool isListed, uint256 price, address owner_) {
-        require(appIdExists[appId], "App does not exist");
+        require(_appExists(appId), "App does not exist");
         Listing memory listing = listings[appId];
-        uint256 tokenId = apps[appId].tokenId;
-        address currentOwner = ownerOf(tokenId);
-
-        return (listing.isListed, listing.price, currentOwner);
+        return (listing.isListed, listing.price, ownerOf(appId));
     }
 
     function isFingerprintUsed(bytes32 fingerprint) external view returns (bool) {
-        return repoFingerprintUsed[fingerprint];
+        return repoFingerprintToAppId[fingerprint] != 0;
+    }
+
+    function getAppByFingerprint(bytes32 fingerprint) external view returns (App memory) {
+        uint256 appId = repoFingerprintToAppId[fingerprint];
+        require(appId != 0, "App does not exist");
+        return apps[appId];
     }
 
     function getEscrowDetails(uint256 appId)
@@ -456,20 +431,16 @@ contract AppMarketplaceToken is
         address from = _ownerOf(tokenId);
 
         if (from != address(0) && to != address(0)) {
-            uint256 appId = tokenIdToAppId[tokenId];
-            if (appId != 0 && listings[appId].isListed) {
-                listings[appId].isListed = false;
-                listings[appId].price = 0;
+            if (listings[tokenId].isListed) {
+                listings[tokenId].isListed = false;
+                listings[tokenId].price = 0;
             }
         }
 
         address previousOwner = super._update(to, tokenId, auth);
 
         if (from != address(0) && to != address(0)) {
-            uint256 appId = tokenIdToAppId[tokenId];
-            if (appId != 0) {
-                emit OwnershipChanged(appId, tokenId, from, to);
-            }
+            emit OwnershipChanged(tokenId, from, to);
         }
 
         return previousOwner;
